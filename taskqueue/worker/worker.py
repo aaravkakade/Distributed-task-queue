@@ -9,6 +9,7 @@ instead of blocking on them.
 import logging
 import os
 import socket
+import threading
 import time
 import traceback
 from typing import Any
@@ -18,7 +19,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from taskqueue import tasks
-from taskqueue.config import DATABASE_URL, POLL_INTERVAL
+from taskqueue.config import (
+    DATABASE_URL,
+    HEARTBEAT_INTERVAL,
+    LEASE_SECONDS,
+    POLL_INTERVAL,
+)
 
 log = logging.getLogger("taskqueue.worker")
 
@@ -28,6 +34,7 @@ UPDATE jobs
        claimed_by = %(worker_id)s,
        attempts = attempts + 1,
        started_at = now(),
+       lease_expires_at = now() + %(lease)s * interval '1 second',
        updated_at = now()
  WHERE id = (
         SELECT id FROM jobs
@@ -41,13 +48,52 @@ RETURNING *
 
 
 class Worker:
-    def __init__(self, dsn: str = DATABASE_URL, worker_id: str | None = None):
+    def __init__(
+        self,
+        dsn: str = DATABASE_URL,
+        worker_id: str | None = None,
+        lease_seconds: float = LEASE_SECONDS,
+    ):
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
+        self.dsn = dsn
+        self.lease_seconds = lease_seconds
         self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
-        self.stopping = False
+        self.stopping = threading.Event()
 
     def claim(self) -> dict | None:
-        return self.conn.execute(CLAIM_SQL, {"worker_id": self.worker_id}).fetchone()
+        return self.conn.execute(
+            CLAIM_SQL, {"worker_id": self.worker_id, "lease": self.lease_seconds}
+        ).fetchone()
+
+    def heartbeat(self, conn: psycopg.Connection | None = None) -> None:
+        """One beat: refresh worker liveness and extend leases on our running jobs.
+
+        The lease, not the workers row, is what protects in-flight jobs — the
+        reaper re-queues any running job whose lease lapses, so a worker that
+        dies mid-task (kill -9, network partition) simply stops extending it.
+        """
+        conn = conn or self.conn
+        conn.execute(
+            """INSERT INTO workers (id) VALUES (%s)
+               ON CONFLICT (id) DO UPDATE SET last_heartbeat = now()""",
+            (self.worker_id,),
+        )
+        conn.execute(
+            """UPDATE jobs
+                  SET lease_expires_at = now() + %s * interval '1 second',
+                      updated_at = now()
+                WHERE claimed_by = %s AND state = 'running'""",
+            (self.lease_seconds, self.worker_id),
+        )
+
+    def _heartbeat_loop(self) -> None:
+        # Own connection: the main connection is busy while a task executes.
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            while not self.stopping.wait(HEARTBEAT_INTERVAL):
+                try:
+                    self.heartbeat(conn)
+                except psycopg.Error:
+                    log.exception("heartbeat failed")
 
     def execute(self, job: dict) -> None:
         try:
@@ -93,9 +139,16 @@ class Worker:
 
     def run_forever(self) -> None:
         log.info("worker %s starting", self.worker_id)
-        while not self.stopping:
-            if not self.run_once():
-                time.sleep(POLL_INTERVAL)
+        self.heartbeat()
+        hb = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        hb.start()
+        try:
+            while not self.stopping.is_set():
+                if not self.run_once():
+                    time.sleep(POLL_INTERVAL)
+        finally:
+            self.stopping.set()
+            hb.join(timeout=HEARTBEAT_INTERVAL + 1)
 
 
 if __name__ == "__main__":
