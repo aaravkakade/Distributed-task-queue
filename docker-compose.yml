@@ -1,0 +1,59 @@
+# Coordinator + 3 workers + reaper + Postgres, each a separate container —
+# genuinely separate nodes talking only through the database.
+#
+#   docker compose up --build
+#   docker compose up --scale worker=8        # more workers
+#   docker compose kill -s SIGKILL worker     # failure drill: watch the reaper
+#
+# Coordinator API: http://localhost:8000
+
+x-app: &app
+  build: .
+  environment: &app-env
+    DATABASE_URL: postgresql://taskqueue:taskqueue@postgres:5432/taskqueue
+  depends_on:
+    coordinator:
+      condition: service_healthy   # coordinator applies migrations on boot
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: taskqueue
+      POSTGRES_PASSWORD: taskqueue
+      POSTGRES_DB: taskqueue
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskqueue -d taskqueue"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  coordinator:
+    build: .
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  worker:
+    <<: *app
+    command: python -m taskqueue.worker.worker
+    deploy:
+      replicas: 3
+
+  reaper:
+    <<: *app
+    command: python -m taskqueue.reaper
+
+volumes:
+  pgdata:
