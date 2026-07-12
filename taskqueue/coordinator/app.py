@@ -1,7 +1,7 @@
 """Coordinator: HTTP API for submitting jobs and querying their status."""
 
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Response
 from psycopg.types.json import Jsonb
@@ -76,6 +76,44 @@ def submit_job(job: JobSubmit, response: Response) -> JobOut:
                 (job.idempotency_key,),
             ).fetchone()
             response.status_code = 200
+    return _job_out(row)
+
+
+@app.get("/jobs")
+def list_jobs(
+    state: Literal["queued", "running", "succeeded", "failed", "dead"] | None = None,
+    limit: int = 100,
+) -> list[JobOut]:
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM jobs
+                WHERE %(state)s::job_state IS NULL OR state = %(state)s
+                ORDER BY id DESC LIMIT %(limit)s""",
+            {"state": state, "limit": min(limit, 1000)},
+        ).fetchall()
+    return [_job_out(r) for r in rows]
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_dead_job(job_id: int) -> JobOut:
+    """Requeue a dead-lettered job with a fresh attempt budget."""
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            """UPDATE jobs
+                  SET state = 'queued', attempts = 0, run_at = now(),
+                      finished_at = NULL, updated_at = now()
+                WHERE id = %s AND state = 'dead'
+               RETURNING *""",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            exists = conn.execute(
+                "SELECT 1 FROM jobs WHERE id = %s", (job_id,)
+            ).fetchone()
+            raise HTTPException(
+                status_code=404 if exists is None else 409,
+                detail="job not found" if exists is None else "job is not dead",
+            )
     return _job_out(row)
 
 

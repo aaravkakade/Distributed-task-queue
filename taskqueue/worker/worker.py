@@ -20,6 +20,8 @@ from psycopg.types.json import Jsonb
 
 from taskqueue import tasks
 from taskqueue.config import (
+    BACKOFF_BASE,
+    BACKOFF_CAP,
     DATABASE_URL,
     HEARTBEAT_INTERVAL,
     LEASE_SECONDS,
@@ -38,12 +40,31 @@ UPDATE jobs
        updated_at = now()
  WHERE id = (
         SELECT id FROM jobs
-         WHERE state = 'queued' AND run_at <= now()
+         WHERE state IN ('queued', 'failed') AND run_at <= now()
          ORDER BY priority DESC, run_at, id
          FOR UPDATE SKIP LOCKED
          LIMIT 1
        )
 RETURNING *
+"""
+
+# On failure, one atomic guarded UPDATE decides the job's fate:
+#   attempts left  -> 'failed', claimable again after exponential backoff
+#   exhausted      -> 'dead' (dead-letter queue)
+FAIL_SQL = """
+UPDATE jobs
+   SET state = CASE WHEN attempts >= max_attempts
+                    THEN 'dead' ELSE 'failed' END::job_state,
+       run_at = now() + LEAST(%(cap)s, %(base)s * power(2, attempts - 1))
+                        * interval '1 second',
+       claimed_by = NULL,
+       lease_expires_at = NULL,
+       started_at = NULL,
+       last_error = %(error)s,
+       finished_at = CASE WHEN attempts >= max_attempts THEN now() END,
+       updated_at = now()
+ WHERE id = %(id)s AND state = 'running' AND claimed_by = %(worker_id)s
+RETURNING state, run_at
 """
 
 
@@ -53,10 +74,14 @@ class Worker:
         dsn: str = DATABASE_URL,
         worker_id: str | None = None,
         lease_seconds: float = LEASE_SECONDS,
+        backoff_base: float = BACKOFF_BASE,
+        backoff_cap: float = BACKOFF_CAP,
     ):
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
         self.dsn = dsn
         self.lease_seconds = lease_seconds
+        self.backoff_base = backoff_base
+        self.backoff_cap = backoff_cap
         self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         self.stopping = threading.Event()
 
@@ -118,14 +143,24 @@ class Worker:
 
     def _finish_failed(self, job: dict, exc: Exception) -> None:
         error = "".join(traceback.format_exception_only(exc)).strip()
-        self.conn.execute(
-            """UPDATE jobs
-                  SET state = 'failed', last_error = %s, finished_at = now(),
-                      updated_at = now()
-                WHERE id = %s AND state = 'running' AND claimed_by = %s""",
-            (error, job["id"], self.worker_id),
-        )
-        log.warning("job %s failed: %s", job["id"], error)
+        row = self.conn.execute(
+            FAIL_SQL,
+            {
+                "id": job["id"],
+                "worker_id": self.worker_id,
+                "error": error,
+                "base": self.backoff_base,
+                "cap": self.backoff_cap,
+            },
+        ).fetchone()
+        if row is None:  # lease was reaped out from under us; nothing to record
+            log.warning("job %s failed but we no longer own it: %s", job["id"], error)
+        elif row["state"] == "dead":
+            log.error("job %s dead after %s attempts: %s",
+                      job["id"], job["attempts"], error)
+        else:
+            log.warning("job %s failed (attempt %s), retry at %s: %s",
+                        job["id"], job["attempts"], row["run_at"], error)
 
     def run_once(self) -> bool:
         """Claim and execute one job. Returns False if the queue was empty."""
