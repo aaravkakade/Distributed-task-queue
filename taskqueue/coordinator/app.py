@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
@@ -26,6 +26,7 @@ class JobSubmit(BaseModel):
     payload: dict[str, Any] = {}
     priority: int = 0
     max_attempts: int = Field(default=5, ge=1)
+    idempotency_key: str | None = Field(default=None, min_length=1)
 
 
 class JobOut(BaseModel):
@@ -54,14 +55,27 @@ def _job_out(row: dict) -> JobOut:
 
 
 @app.post("/jobs", status_code=201)
-def submit_job(job: JobSubmit) -> JobOut:
+def submit_job(job: JobSubmit, response: Response) -> JobOut:
+    """Enqueue a job. With an idempotency_key, retried submissions (client
+    timeout, network blip, double-click) return the original job instead of
+    enqueueing a duplicate: ON CONFLICT DO NOTHING makes the race safe even
+    across coordinators, since the UNIQUE index is the arbiter."""
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            """INSERT INTO jobs (task_name, payload, priority, max_attempts)
-               VALUES (%s, %s, %s, %s)
+            """INSERT INTO jobs (task_name, payload, priority, max_attempts,
+                                 idempotency_key)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (idempotency_key) DO NOTHING
                RETURNING *""",
-            (job.task_name, Jsonb(job.payload), job.priority, job.max_attempts),
+            (job.task_name, Jsonb(job.payload), job.priority, job.max_attempts,
+             job.idempotency_key),
         ).fetchone()
+        if row is None:  # replay: key already used
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = %s",
+                (job.idempotency_key,),
+            ).fetchone()
+            response.status_code = 200
     return _job_out(row)
 
 
