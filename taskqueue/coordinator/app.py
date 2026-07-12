@@ -126,6 +126,43 @@ def get_job(job_id: int) -> JobOut:
     return _job_out(row)
 
 
+@app.get("/stats")
+def stats() -> dict:
+    """Operational snapshot: queue depth per state, backlog age, live workers,
+    and completion throughput over the trailing minute."""
+    with db.get_pool().connection() as conn:
+        by_state = {
+            r["state"]: r["count"]
+            for r in conn.execute(
+                "SELECT state, count(*) FROM jobs GROUP BY state"
+            ).fetchall()
+        }
+        row = conn.execute(
+            """SELECT
+                 (SELECT extract(epoch FROM now() - min(run_at))
+                    FROM jobs
+                   WHERE state IN ('queued', 'failed') AND run_at <= now())
+                   AS oldest_ready_seconds,
+                 (SELECT count(*) FROM workers
+                   WHERE last_heartbeat > now() - interval '30 seconds')
+                   AS live_workers,
+                 (SELECT count(*) FROM jobs
+                   WHERE state = 'succeeded'
+                     AND finished_at > now() - interval '60 seconds')
+                   AS succeeded_last_minute"""
+        ).fetchone()
+    return {
+        "jobs": {s: by_state.get(s, 0)
+                 for s in ("queued", "running", "succeeded", "failed", "dead")},
+        "oldest_ready_seconds": (
+            float(row["oldest_ready_seconds"])
+            if row["oldest_ready_seconds"] is not None else None
+        ),
+        "live_workers": row["live_workers"],
+        "succeeded_last_minute": row["succeeded_last_minute"],
+    }
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     with db.get_pool().connection() as conn:
