@@ -16,6 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from taskqueue.config import DATABASE_URL, HEARTBEAT_INTERVAL, REAP_INTERVAL
+from taskqueue.leader import LeaderLock
 
 log = logging.getLogger("taskqueue.reaper")
 
@@ -44,8 +45,14 @@ RETURNING id
 
 
 class Reaper:
+    """Run any number of these for availability; an advisory-lock election
+    picks one leader, and only the leader reaps. Standbys poll for the lock
+    and take over as soon as a dead leader's session releases it."""
+
     def __init__(self, dsn: str = DATABASE_URL):
         self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+        self.lock = LeaderLock(self.conn)
+        self.is_leader = False
         self.stopping = False
 
     def reap_once(self) -> tuple[list[int], list[int]]:
@@ -65,10 +72,20 @@ class Reaper:
             log.warning("buried exhausted jobs (dead-letter): %s", buried)
         return requeued, buried
 
+    def step(self) -> bool:
+        """One election-aware tick. Returns True if we acted as leader."""
+        if not self.is_leader:
+            self.is_leader = self.lock.try_acquire()
+            if self.is_leader:
+                log.info("became reaper leader")
+        if self.is_leader:
+            self.reap_once()
+        return self.is_leader
+
     def run_forever(self) -> None:
         log.info("reaper starting (interval %ss)", REAP_INTERVAL)
         while not self.stopping:
-            self.reap_once()
+            self.step()
             time.sleep(REAP_INTERVAL)
 
 

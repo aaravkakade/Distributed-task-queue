@@ -51,9 +51,13 @@ services:
     deploy:
       replicas: 3
 
+  # two replicas: advisory-lock leader election means one reaps, one is a
+  # hot standby that takes over if the leader dies
   reaper:
     <<: *app
     command: python -m taskqueue.reaper
+    deploy:
+      replicas: 2
 
 volumes:
   pgdata:
